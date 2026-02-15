@@ -2,6 +2,10 @@ const express = require("express");
 const cors = require("cors");
 const app = express();
 require("dotenv").config();
+var admin = require("firebase-admin");
+
+var serviceAccount = require("./firebase-admin-key.json");
+
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const port = process.env.PORT || 3000;
 
@@ -9,6 +13,35 @@ const port = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+//auth-->>
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const verifyFirebaseToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) {
+      return res.status(401).send({ message: "Unauthorized Access !" });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).send({ message: "Unauthorized Access !" });
+    }
+
+    const userInfo = await admin.auth().verifyIdToken(token);
+    req.tokenEmail = userInfo.email;
+
+    next();
+  } catch (err) {
+    return res.status(401).send({ message: "Invalid Token !" });
+  }
+};
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.stwfv7r.mongodb.net/?appName=Cluster0`;
 
@@ -70,11 +103,12 @@ async function run() {
 
     //post a query-->>
 
-    app.post("/queries", async (req, res) => {
+    app.post("/queries", verifyFirebaseToken, async (req, res) => {
       const data = req.body;
-      console.log(data);
+
       const newData = {
         ...data,
+        userEmail: req.tokenEmail,
         createdAt: new Date(),
         recommendationCount: 0,
       };
@@ -84,28 +118,42 @@ async function run() {
 
     //myQueries-->>>
 
-    app.get("/my-queries", async (req, res) => {
+    app.get("/my-queries", verifyFirebaseToken, async (req, res) => {
       const email = req.query.email;
-      console.log(email);
+      if (req.tokenEmail != email) {
+        return res.status(403).send({ message: "forbidden access !" });
+      }
+      // console.log(email);
       const query = { userEmail: email };
       const result = await queriesCollection.find(query).toArray();
-      console.log(result);
+      // console.log(result);
       res.send(result);
     });
 
     //delete queries-->>
 
-    app.delete("/queries/:id", async (req, res) => {
+    app.delete("/queries/:id", verifyFirebaseToken, async (req, res) => {
       try {
         const { id } = req.params;
         const query = { _id: new ObjectId(id) };
+
+        const queryDoc = await queriesCollection.findOne(query);
+        if (!queryDoc) {
+          return res.status(404).send({ message: " Query not found !" });
+        }
+
+        if (queryDoc.userEmail !== req.tokenEmail) {
+          return res.status(403).send({ message: " Forbidden Access !" });
+        }
+
         const result = await queriesCollection.deleteOne(query);
 
         if (result.deletedCount === 0) {
           return res.status(400).send({ message: "Query not found" });
         }
+
         // delete all recommendations for this query
-        // await recommendationsCollection.deleteMany({ queryId: id });
+        await recommendationsCollection.deleteMany({ queryId: id });
         res.send(result);
       } catch (err) {
         console.log(err);
@@ -115,9 +163,20 @@ async function run() {
 
     //update queries--->>
 
-    app.patch("/queries/:id", async (req, res) => {
+    app.patch("/queries/:id", verifyFirebaseToken, async (req, res) => {
       const { id } = req.params;
       const data = req.body;
+
+      const query = { _id: new ObjectId(id) };
+
+      const queryDoc = await queriesCollection.findOne(query);
+      if (!queryDoc) {
+        return res.status(404).send({ message: " Query not found !" });
+      }
+
+      if (queryDoc.userEmail !== req.tokenEmail) {
+        return res.status(403).send({ message: " Forbidden Access !" });
+      }
 
       //safety
       delete data.createdAt;
@@ -126,7 +185,6 @@ async function run() {
       delete data.userName;
       delete data.userPhoto;
 
-      const query = { _id: new ObjectId(id) };
       const updatedData = { $set: data };
 
       const result = await queriesCollection.updateOne(query, updatedData);
@@ -136,11 +194,14 @@ async function run() {
 
     //insert recommendation-->>
 
-    app.post("/recommendations", async (req, res) => {
+    app.post("/recommendations", verifyFirebaseToken, async (req, res) => {
       try {
         const data = req.body;
-
-        const newData = { ...data, createdAt: new Date() };
+        const newData = {
+          ...data,
+          recommenderEmail: req.tokenEmail,
+          createdAt: new Date(),
+        };
         const result = await recommendationsCollection.insertOne(newData);
 
         const updateQuery = await queriesCollection.updateOne(
@@ -174,43 +235,53 @@ async function run() {
       }
     });
 
-    app.delete("/recommendations/:id", async (req, res) => {
-      try {
-        const id = req.params.id;
+    app.delete(
+      "/recommendations/:id",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
 
-        // 1) find recommendation to get queryId
-        const rec = await recommendationsCollection.findOne({
-          _id: new ObjectId(id),
-        });
-        if (!rec)
-          return res.status(404).send({ message: "Recommendation not found" });
+          // 1) find recommendation to get queryId
+          const rec = await recommendationsCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!rec)
+            return res
+              .status(404)
+              .send({ message: "Recommendation not found" });
 
-        // 2) delete recommendation
-        const result = await recommendationsCollection.deleteOne({
-          _id: new ObjectId(id),
-        });
+          // 2) delete recommendation
+          const result = await recommendationsCollection.deleteOne({
+            _id: new ObjectId(id),
+          });
 
-        // 3) decrease recommendationCount
-        await queriesCollection.updateOne(
-          { _id: new ObjectId(rec.queryId) },
-          { $inc: { recommendationCount: -1 } },
-        );
+          // 3) decrease recommendationCount
+          await queriesCollection.updateOne(
+            { _id: new ObjectId(rec.queryId) },
+            { $inc: { recommendationCount: -1 } },
+          );
 
-        res.send(result);
-      } catch (err) {
-        console.log(err);
-        res.status(500).send({ message: "Failed to delete recommendation" });
-      }
-    });
+          res.send(result);
+        } catch (err) {
+          console.log(err);
+          res.status(500).send({ message: "Failed to delete recommendation" });
+        }
+      },
+    );
 
     //my recommendations-->>
 
-    app.get("/my-recommendations", async (req, res) => {
+    app.get("/my-recommendations", verifyFirebaseToken, async (req, res) => {
       try {
         const email = req.query.email;
 
         if (!email) {
           return res.status(400).send({ message: "Email is required" });
+        }
+
+        if (req.tokenEmail !== email) {
+          return res.status(403).send({ message: "Forbidden" });
         }
 
         const result = await recommendationsCollection
@@ -227,27 +298,34 @@ async function run() {
 
     //recommendation for me -->>
 
-    app.get("/recommendations-for-me", async (req, res) => {
-      try {
-        const email = req.query.email;
+    app.get(
+      "/recommendations-for-me",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const email = req.query.email;
 
-        if (!email) {
-          return res.status(400).send({ message: "Email is required" });
+          if (!email) {
+            return res.status(400).send({ message: "Email is required" });
+          }
+          if (req.tokenEmail !== email) {
+            return res.status(403).send({ message: "Forbidden" });
+          }
+
+          const result = await recommendationsCollection
+            .find({ userEmail: email })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          res.send(result);
+        } catch (err) {
+          console.log(err);
+          res
+            .status(500)
+            .send({ message: "Failed to fetch recommendations for me" });
         }
-
-        const result = await recommendationsCollection
-          .find({ userEmail: email })
-          .sort({ createdAt: -1 })
-          .toArray();
-
-        res.send(result);
-      } catch (err) {
-        console.log(err);
-        res
-          .status(500)
-          .send({ message: "Failed to fetch recommendations for me" });
-      }
-    });
+      },
+    );
 
     await client.db("admin").command({ ping: 1 });
     console.log(
