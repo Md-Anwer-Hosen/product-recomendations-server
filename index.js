@@ -4,14 +4,20 @@ const app = express();
 require("dotenv").config();
 var admin = require("firebase-admin");
 
-var serviceAccount = require("./firebase-admin-key.json");
+const serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_JSON);
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const port = process.env.PORT || 3000;
 
 //middleware-->>
 
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:5173", ""],
+    credentials: true,
+  }),
+);
+
 app.use(express.json());
 
 //auth-->>
